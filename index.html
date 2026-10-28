@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>My Radio</title>
+<style>
+  body{margin:0;font-family:-apple-system,system-ui,sans-serif;background:#111;color:#eee}
+  main{max-width:480px;margin:0 auto;padding:20px}
+  h1{font-size:26px}
+  section{background:#1c1c1e;border-radius:14px;padding:16px;margin:14px 0}
+  label{display:block;font-size:14px;color:#aaa;margin:10px 0 4px}
+  input,select,button{width:100%;box-sizing:border-box;font-size:17px;padding:12px;border-radius:10px;border:0;margin-top:4px}
+  input,select{background:#2c2c2e;color:#eee}
+  button{background:#1db954;color:#000;font-weight:600;margin-top:12px}
+  button.stop{background:#ff453a;color:#fff}
+  button.grey{background:#3a3a3c;color:#eee}
+  code{background:#2c2c2e;padding:2px 5px;border-radius:5px;word-break:break-all}
+  #now{font-size:20px;min-height:60px}
+  #status{color:#aaa;font-size:14px}
+  .hide{display:none}
+</style>
+</head>
+<body>
+<main>
+<h1>📻 My Radio</h1>
+
+<section id="s-login">
+  <label>Spotify Client ID</label>
+  <input id="cid" placeholder="paste your Client ID here" autocapitalize="off" autocorrect="off">
+  <p>Redirect address to register in the Spotify dashboard:<br><code id="redir"></code></p>
+  <button id="btn-login">Log in with Spotify</button>
+</section>
+
+<section id="s-main" class="hide">
+  <label>1. Host clips (select all your numbered mp3 files)</label>
+  <input type="file" id="files" accept="audio/*" multiple>
+  <p id="clipinfo"></p>
+
+  <label>2. Music source</label>
+  <select id="src"><option value="liked">Liked Songs</option></select>
+
+  <label>3. Songs between host clips</label>
+  <input type="number" id="n" value="1" min="1" max="10">
+
+  <button id="btn-start">▶ Start radio</button>
+  <button id="btn-stop" class="stop hide">■ Stop</button>
+  <button id="btn-logout" class="grey">Log out</button>
+</section>
+
+<section>
+  <div id="now">Ready.</div>
+  <div id="status"></div>
+</section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const LS = localStorage;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const REDIRECT = location.origin + location.pathname;
+const SCOPES = "user-read-playback-state user-modify-playback-state user-library-read playlist-read-private";
+const audio = new Audio();
+let running = false, wake = null, device = null;
+
+$("redir").textContent = REDIRECT;
+$("cid").value = LS.cid || "";
+const status = t => $("status").textContent = t;
+const now = t => $("now").textContent = t;
+
+/* ---------- Clip storage (IndexedDB) ---------- */
+const dbp = new Promise((res, rej) => {
+  const r = indexedDB.open("radio", 1);
+  r.onupgradeneeded = () => r.result.createObjectStore("clips");
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+async function db(mode, fn) {
+  const d = await dbp;
+  return new Promise((res, rej) => {
+    const t = d.transaction("clips", mode);
+    const rq = fn(t.objectStore("clips"));
+    t.oncomplete = () => res(rq && rq.result);
+    t.onerror = () => rej(t.error);
+  });
+}
+async function getClips() {
+  const all = await db("readonly", s => s.getAll());
+  return all.sort((a, b) => a.num - b.num);
+}
+async function showClips() {
+  const c = await getClips();
+  $("clipinfo").textContent = c.length
+    ? c.length + " clips stored, order: " + c.map(x => x.num).join(", ")
+    : "No clips stored yet.";
+}
+$("files").onchange = async e => {
+  const files = [...e.target.files];
+  await db("readwrite", s => s.clear());
+  for (const f of files) {
+    const m = f.name.match(/\d+/);
+    if (!m) continue;
+    const num = parseInt(m[0], 10);
+    await db("readwrite", s => s.put({ num, name: f.name, blob: f }, num));
+  }
+  showClips();
+};
+
+/* ---------- Spotify login (PKCE) ---------- */
+function rand(n) {
+  const a = new Uint8Array(n);
+  crypto.getRandomValues(a);
+  return btoa(String.fromCharCode(...a)).replace(/[^A-Za-z0-9]/g, "").slice(0, 64);
+}
+$("btn-login").onclick = async () => {
+  const id = $("cid").value.trim();
+  if (!id) return alert("Please paste your Client ID first.");
+  LS.cid = id;
+  const v = rand(100);
+  LS.verifier = v;
+  const h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(v));
+  const ch = btoa(String.fromCharCode(...new Uint8Array(h)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+  location.href = "https://accounts.spotify.com/authorize?" + new URLSearchParams({
+    client_id: id, response_type: "code", redirect_uri: REDIRECT,
+    scope: SCOPES, code_challenge_method: "S256", code_challenge: ch
+  });
+};
+async function tokenReq(body) {
+  const r = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: LS.cid, ...body })
+  });
+  const j = await r.json();
+  if (!j.access_token) throw new Error("Login failed, please log in again.");
+  LS.access = j.access_token;
+  LS.expires = Date.now() + j.expires_in * 1000 - 60000;
+  if (j.refresh_token) LS.refresh = j.refresh_token;
+}
+async function getToken() {
+  if (Date.now() > +LS.expires) await tokenReq({ grant_type: "refresh_token", refresh_token: LS.refresh });
+  return LS.access;
+}
+async function api(path, opt = {}) {
+  const t = await getToken();
+  const r = await fetch("https://api.spotify.com/v1" + path, {
+    ...opt, headers: { Authorization: "Bearer " + t, "Content-Type": "application/json" }
+  });
+  if (r.status === 204 || r.status === 202) return null;
+  let j = null;
+  try { j = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error((j && j.error && j.error.message) || ("Error " + r.status));
+  return j;
+}
+$("btn-logout").onclick = () => { ["access", "refresh", "expires", "verifier"].forEach(k => delete LS[k]); location.reload(); };
+
+/* ---------- Music library ---------- */
+async function pageAll(url) {
+  const uris = [];
+  while (url) {
+    const j = await api(url);
+    j.items.forEach(i => {
+      const t = i.track || i.item;
+      if (t && t.uri && t.uri.startsWith("spotify:track:")) uris.push(t.uri);
+    });
+    url = j.next ? j.next.replace("https://api.spotify.com/v1", "") : null;
+    status("Loading songs… " + uris.length);
+  }
+  return uris;
+}
+async function loadSongs(src) {
+  if (src === "liked") return pageAll("/me/tracks?limit=50");
+  try { return await pageAll(`/playlists/${src}/items?limit=50`); }
+  catch (e) { return await pageAll(`/playlists/${src}/tracks?limit=50`); }
+}
+async function fillPlaylists() {
+  try {
+    const j = await api("/me/playlists?limit=50");
+    j.items.filter(p => p).forEach(p => {
+      const o = document.createElement("option");
+      o.value = p.id; o.textContent = "Playlist: " + p.name;
+      $("src").appendChild(o);
+    });
+  } catch (e) { status("Could not load playlists: " + e.message); }
+}
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+/* ---------- The radio ---------- */
+function playClip(c) {
+  return new Promise(res => {
+    now("🎙️ Host: " + c.name);
+    audio.src = URL.createObjectURL(c.blob);
+    audio.onended = audio.onerror = () => { URL.revokeObjectURL(audio.src); res(); };
+    audio.play().catch(() => res());
+  });
+}
+async function playSong(uri) {
+  await api("/me/player/play" + (device ? "?device_id=" + device : ""), {
+    method: "PUT", body: JSON.stringify({ uris: [uri] })
+  });
+  await sleep(2500);
+  while (running) {
+    let s = null;
+    try { s = await api("/me/player"); } catch (e) {}
+    if (s && s.item) {
+      now("🎵 " + s.item.name + " – " + s.item.artists.map(a => a.name).join(", "));
+      const rem = s.item.duration_ms - s.progress_ms;
+      if (rem < 2500) {
+        await sleep(Math.max(0, rem - 400));
+        try { await api("/me/player/pause", { method: "PUT" }); } catch (e) {}
+        return;
+      }
+    }
+    await sleep(1000);
+  }
+}
+async function start() {
+  const clips = await getClips();
+  if (!clips.length) return alert("Please select your mp3 clips first.");
+  // unlock audio on iPhone (must happen right after a tap)
+  audio.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+  audio.play().catch(() => {});
+  try { wake = await navigator.wakeLock.request("screen"); } catch (e) {}
+
+  running = true;
+  $("btn-start").classList.add("hide"); $("btn-stop").classList.remove("hide");
+  try {
+    const dev = await api("/me/player/devices");
+    const d = dev.devices.find(x => x.is_active) || dev.devices.find(x => x.type === "Smartphone") || dev.devices[0];
+    if (!d) throw new Error("No Spotify device found. Open the Spotify app, play any song for a second, pause it, then come back and tap Start.");
+    device = d.id;
+    status("Loading your songs…");
+    let songs = await loadSongs($("src").value);
+    if (!songs.length) throw new Error("No songs found in that source.");
+    status(songs.length + " songs loaded. Keep this screen on.");
+    let queue = [], idx = 0;
+    const per = Math.max(1, parseInt($("n").value, 10) || 1);
+    while (running) {
+      await playClip(clips[idx % clips.length]); idx++;
+      for (let k = 0; k < per && running; k++) {
+        if (!queue.length) queue = shuffle([...songs]);
+        await playSong(queue.pop());
+      }
+    }
+  } catch (e) {
+    status("⚠️ " + e.message);
+  }
+  stop(false);
+}
+function stop(pause = true) {
+  running = false;
+  audio.pause();
+  if (pause) api("/me/player/pause", { method: "PUT" }).catch(() => {});
+  if (wake) { wake.release().catch(() => {}); wake = null; }
+  $("btn-stop").classList.add("hide"); $("btn-start").classList.remove("hide");
+  now("Stopped.");
+}
+$("btn-start").onclick = start;
+$("btn-stop").onclick = () => stop(true);
+document.addEventListener("visibilitychange", async () => {
+  if (running && document.visibilityState === "visible") {
+    try { wake = await navigator.wakeLock.request("screen"); } catch (e) {}
+  }
+});
+
+/* ---------- Startup ---------- */
+(async () => {
+  const code = new URLSearchParams(location.search).get("code");
+  try {
+    if (code) {
+      await tokenReq({ grant_type: "authorization_code", code, redirect_uri: REDIRECT, code_verifier: LS.verifier });
+      history.replaceState({}, "", REDIRECT);
+    }
+  } catch (e) { status("⚠️ " + e.message); }
+  if (LS.access || LS.refresh) {
+    $("s-login").classList.add("hide"); $("s-main").classList.remove("hide");
+    showClips(); fillPlaylists();
+  }
+})();
+</script>
+</body>
+</html>
